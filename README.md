@@ -1,4 +1,6 @@
-# Protein-Hunter 😈
+# Protein-Hunter 😈 (Membrane-Aware Fork)
+
+> This fork adds **PPM3.0-based membrane avoidance** for designing binders against outer-membrane/other membrane proteins: binders are only conditioned to contact residues that are solvent-exposed outside the membrane, or that line the aqueous lumen of a barrel anchored in the membrane — never residues embedded in the lipid bilayer. See [🧬 Membrane-Avoiding Binder Design](#-membrane-avoiding-binder-design-ppm30) below.
 
 <p align="center">
   <img src="./protein_hunter.png" alt="Protein Hunter" width="500"/>
@@ -53,6 +55,46 @@ The setup script will automatically:
 We have implemented two different AF3-style models in our Protein Hunter pipeline (more models will be added in the future):
 - Boltz1/2
 - Chai1
+
+
+## 🧬 Membrane-Avoiding Binder Design (PPM3.0)
+
+For membrane proteins (e.g. outer-membrane barrels like BamA, LptD, OmpA, porins), you generally don't want a soluble binder conditioned to contact residues that are actually embedded in the lipid bilayer — they're not reachable. This fork uses [PPM3.0](https://opm.phar.umich.edu/ppm_server) output (`utils/membrane_utils.py`) to classify every target residue into:
+
+- **exposed** — Cα outside the membrane z-band (from the PPM `1/2 of bilayer thickness` boundary): always a valid target.
+- **pore_facing** — Cα inside the membrane band, but the side chain (Cα→Cβ direction) points *toward* the local channel/barrel axis rather than away from it: still valid (e.g. the aqueous lumen of a beta barrel).
+- **lipid_facing** — Cα inside the membrane band with the side chain pointing *away* from the axis, into the lipid: excluded.
+
+The exposed/pore-facing distinction is a direction test, not a distance threshold: a barrel wall is one residue thick, so backbone Cα radius from the pore axis is nearly identical for lipid- and pore-facing residues in the same strand — only the side-chain direction alternates.
+
+**1. Get a PPM3.0 structure.** Run your target (e.g. an AF3/Boltz-folded monomer) through the [PPM3.0 server](https://opm.phar.umich.edu/ppm_server) — this reorients the structure so the membrane normal is the z-axis and writes the `...out.pdb` used below.
+
+**2. Standalone: derive a residue list.** To inspect the classification or paste a residue list directly into `--contact_residues`:
+```bash
+python utils/ppm_contact_residues.py --ppm_pdb /path/to/target_out.pdb
+# prints a summary to stderr and a comma-separated residue list to stdout
+```
+
+**3. Pipeline integration.** Both backends accept `--ppm_pdb` directly — it restricts (or, if `--contact_residues` is omitted, fully populates) the pocket-conditioning contact set to membrane-safe residues:
+
+```bash
+# Boltz edition
+python boltz_ph/design.py \
+    --protein_seqs "<target sequence>" \
+    --ppm_pdb /path/to/target_out.pdb \
+    --name bama_membrane_avoiding \
+    --num_designs 20 --num_cycles 7
+
+# Chai edition
+python chai_ph/design.py \
+    --target_seq "<target sequence>" \
+    --ppm_pdb /path/to/target_out.pdb \
+    --jobname bama_membrane_avoiding
+```
+
+If `--contact_residues` is also given, it's intersected with the membrane-safe set (any residues that fall in the lipid-facing region are dropped, with a warning). Add `--ppm_exclude_pore_facing` to keep only fully-exposed residues (drop barrel-lumen residues too).
+
+Both backends condition generation the same way Boltz2's native `pocket` constraint works — actively biasing the diffusion trajectory, not just filtering results afterward. `chai_ph` reaches this via chai-lab's own (previously unused in this repo) `TokenPairPocketRestraint` feature; both backends also run a post-cycle-0 geometric retry and a high-ipTM save gate against the same residue set (`--contact_cutoff`, `--no_contact_filter`, `--max_contact_filter_retries`).
 
 
 ## Run Code End-to-End

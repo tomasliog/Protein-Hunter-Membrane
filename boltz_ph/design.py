@@ -89,6 +89,38 @@ def parse_args():
     parser.add_argument("--contact_cutoff", default=15.0, type=float)
 
     parser.add_argument(
+        "--ppm_pdb",
+        default="",
+        type=str,
+        help=(
+            "Path to a PPM3.0-oriented target structure ('...out.pdb') used to restrict "
+            "--contact_residues to membrane-safe residues: solvent-exposed outside the "
+            "membrane, or pore/lumen-facing inside a barrel anchored in the membrane. "
+            "For multiple target chains, separate paths by |, matching --protein_seqs order "
+            "(use an empty segment, e.g. 'path1||path3', to skip a chain). If "
+            "--contact_residues is also given for a chain, it is intersected with that "
+            "chain's membrane-safe set (residues that fall in the lipid-facing membrane "
+            "region are dropped, with a warning); if omitted, the full membrane-safe set "
+            "is used as that chain's pocket-conditioning contacts."
+        ),
+    )
+    parser.add_argument(
+        "--ppm_chain_id",
+        default="A",
+        type=str,
+        help=(
+            "Chain ID to read from --ppm_pdb, or | separated per target chain. Default 'A' "
+            "matches single-chain PPM3.0 monomer outputs."
+        ),
+    )
+    parser.add_argument(
+        "--ppm_exclude_pore_facing",
+        action="store_true",
+        default=False,
+        help="Exclude barrel-lumen/pore-facing residues; keep only residues fully outside the membrane.",
+    )
+
+    parser.add_argument(
         "--alphafold_dir", default=os.path.expanduser("~/alphafold3"), type=str
     )
     parser.add_argument("--af3_docker_name", default="alphafold3_yc", type=str)

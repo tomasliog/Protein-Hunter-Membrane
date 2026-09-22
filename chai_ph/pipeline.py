@@ -13,7 +13,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 from chai_lab.chai1 import _bin_centers
-from typing import Optional
+from typing import List, Optional
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from chai_ph.predict import ChaiFolder
 from chai_ph.helpers import (
@@ -24,8 +24,10 @@ from chai_ph.helpers import (
     get_backbone_coords_from_result,
     prepare_refinement_coords,
     compute_ca_rmsd,
+    binder_binds_contacts,
 )
 from LigandMPNN.wrapper import LigandMPNNWrapper
+from utils.membrane_utils import get_membrane_safe_residues
 
 def optimize_protein_design(
     folder: ChaiFolder,
@@ -62,6 +64,12 @@ def optimize_protein_design(
     viewer: Optional[py2Dmol.view] = None,
     render_freq: int = 1,
     plot: bool = False,
+    contact_residues: Optional[List[int]] = None,
+    pocket_distance_threshold: float = 15.0,
+    no_contact_filter: bool = False,
+    max_contact_filter_retries: int = 6,
+    contact_cutoff: float = 15.0,
+    percent_x_fraction: float = 0.0,
 ):
 
     """
@@ -249,7 +257,16 @@ def optimize_protein_design(
             template_weight = compute_template_weight(
                 prev["state"].result["pde"], prev["n_target"]
             )
-        folder.prep_inputs(chains)
+        pocket_kwargs = {}
+        if is_binder_design and not is_ligand_target and contact_residues:
+            pocket_kwargs = dict(
+                pocket_target_residues=contact_residues,
+                pocket_target_seq=target_seq,
+                pocket_binder_chain=binder_chain,
+                pocket_target_chain=target_chain,
+                pocket_distance_threshold=pocket_distance_threshold,
+            )
+        folder.prep_inputs(chains, **pocket_kwargs)
         folder.get_embeddings()
         folder.run_trunk(
             num_trunk_recycles=num_trunk_recycles, template_weight=template_weight
@@ -432,20 +449,60 @@ def optimize_protein_design(
     metrics_list = []
     seq_per_cycle = []
 
-    # Step 0
-    print(f"Initial seq: {initial_seq}")
+    # Step 0 (with optional pocket-contact-filter retry, mirroring boltz_ph's
+    # cycle-0 retry: resample the initial sequence if the binder doesn't
+    # geometrically contact any allowed (e.g. membrane-safe) target residue)
+    apply_contact_filter = (
+        is_binder_design
+        and not is_ligand_target
+        and bool(contact_residues)
+        and not no_contact_filter
+    )
+    contact_filter_attempt = 0
     prev = {"seq": initial_seq}
-    try:
-        prev["state"] = fold_sequence(prev["seq"], is_first_iteration=True)
-        if prev["state"] is None or prev["state"].result is None:
-            raise RuntimeError("Initial folding failed to produce results.")
+    while True:
+        print(f"Initial seq: {prev['seq']}")
+        try:
+            prev["state"] = fold_sequence(prev["seq"], is_first_iteration=True)
+            if prev["state"] is None or prev["state"].result is None:
+                raise RuntimeError("Initial folding failed to produce results.")
 
-        prev["bb"] = get_backbone_coords_from_result(prev["state"])
-        prev["pdb"] = f"{prefix}/cycle_0.cif"
-        folder.save(
-            prev["pdb"],
-            use_entity_names=use_entity_names,
-        )
+            prev["bb"] = get_backbone_coords_from_result(prev["state"])
+            prev["pdb"] = f"{prefix}/cycle_0.cif"
+            folder.save(
+                prev["pdb"],
+                use_entity_names=use_entity_names,
+            )
+        except Exception as e:
+            print(f"Error during initial folding (Step 0): {e}")
+            return None
+
+        contact_check_okay = True
+        if apply_contact_filter:
+            try:
+                contact_check_okay = binder_binds_contacts(
+                    prev["pdb"], binder_chain, target_chain, contact_residues,
+                    cutoff=contact_cutoff,
+                )
+                if not contact_check_okay:
+                    print(
+                        "❌ Binder does NOT contact required residues after cycle 0. Retrying..."
+                    )
+            except Exception as e:
+                print(f"WARNING: Could not perform binder-contact check: {e}")
+                contact_check_okay = True  # Fail open
+
+        if contact_check_okay:
+            break
+        contact_filter_attempt += 1
+        if contact_filter_attempt >= max_contact_filter_retries:
+            print("WARNING: Max retries for contact filtering reached. Proceeding.")
+            break
+        prev["seq"] = sample_seq(len(initial_seq), frac_X=percent_x_fraction)
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    try:
         msg, metric_dict = format_metrics(prev)
         iptm0 = metric_dict.get("iptm") if is_binder_design else None
         plddt0 = metric_dict.get("plddt")
@@ -463,7 +520,7 @@ def optimize_protein_design(
         print(f"{prefix} | Step 0: {msg}")
 
     except Exception as e:
-        print(f"Error during initial folding (Step 0): {e}")
+        print(f"Error computing Step 0 metrics: {e}")
         return None
 
     best_step = 0
@@ -521,6 +578,20 @@ def optimize_protein_design(
                 and metric_dict.get("alanine_count", 0)/len(new_seq) <= 0.2
                 and "seq" in new
             )
+
+            if save_yaml_this_design and apply_contact_filter:
+                try:
+                    contact_binds = binder_binds_contacts(
+                        new["pdb"], binder_chain, target_chain, contact_residues,
+                        cutoff=contact_cutoff,
+                    )
+                    if not contact_binds:
+                        save_yaml_this_design = False
+                        print(
+                            "⛔️ Not saving YAML: binder failed contact check for high ipTM save."
+                        )
+                except Exception as e:
+                    print(f"WARNING: Exception during contact check: {e}. Saving YAML anyway.")
 
             if save_yaml_this_design:
                 # --- 1. Define Base Names and Dirs ---
@@ -852,6 +923,15 @@ class ProteinHunter_Chai:
         self.binder_chain = "A"
         self.target_chain = "B"
 
+        self.contact_residues_str = args.contact_residues
+        self.ppm_pdb = args.ppm_pdb
+        self.ppm_chain_id = args.ppm_chain_id
+        self.ppm_exclude_pore_facing = args.ppm_exclude_pore_facing
+        self.pocket_distance_threshold = args.pocket_distance_threshold
+        self.no_contact_filter = args.no_contact_filter
+        self.max_contact_filter_retries = args.max_contact_filter_retries
+        self.contact_cutoff = args.contact_cutoff
+
         def check(folder):
             return os.path.exists(folder)
 
@@ -875,6 +955,10 @@ class ProteinHunter_Chai:
         self.omit_AA = clean_protein_sequence(self.omit_aa)
         if self.omit_AA == "":
             self.omit_AA = None
+
+        # Resolve --contact_residues against --ppm_pdb (if given), after
+        # target_seq/binder_mode are finalized above.
+        self.contact_residues = self._resolve_contact_residues()
 
         if self.show_visual: 
             self.viewer = py2Dmol.view((600, 400), color="plddt")
@@ -918,6 +1002,60 @@ class ProteinHunter_Chai:
 
         self.target_entity_type = "ligand" if is_ligand_target else "protein"
 
+
+    def _resolve_contact_residues(self) -> List[int]:
+        """
+        Resolves --contact_residues against --ppm_pdb (if given): membrane-
+        safe residues (solvent-exposed outside the membrane, or pore-facing
+        inside a barrel) are used directly as pocket-conditioning contacts;
+        if --contact_residues is also given, it's intersected with that set.
+        Only meaningful for protein-target binder design (chai_ph's native
+        pocket restraint, like Boltz2's, only applies to protein contacts).
+        """
+        if self.binder_mode != "protein":
+            return []
+
+        user_residues = (
+            [int(r) for r in self.contact_residues_str.split(",") if r.strip() != ""]
+            if self.contact_residues_str.strip()
+            else []
+        )
+
+        if not self.ppm_pdb.strip():
+            return user_residues
+
+        safe_residues = set(
+            get_membrane_safe_residues(
+                self.ppm_pdb,
+                chain_id=self.ppm_chain_id or None,
+                include_pore_facing=not self.ppm_exclude_pore_facing,
+            )
+        )
+
+        if user_residues:
+            final_residues = [r for r in user_residues if r in safe_residues]
+            dropped = sorted(set(user_residues) - set(final_residues))
+            if dropped:
+                print(
+                    f"⚠️  Dropping {len(dropped)} user-specified contact residue(s) that fall "
+                    f"inside the membrane (lipid-facing): {dropped}"
+                )
+        else:
+            final_residues = sorted(safe_residues)
+
+        print(
+            f"🧬 PPM membrane filter ({self.ppm_pdb}): "
+            f"{len(final_residues)} membrane-safe contact residue(s) available."
+        )
+
+        if self.target_seq and final_residues and max(final_residues) > len(self.target_seq):
+            print(
+                f"⚠️  WARNING: PPM residue numbering (max {max(final_residues)}) exceeds "
+                f"target_seq length ({len(self.target_seq)}). Ensure --ppm_pdb corresponds to "
+                "the exact same target sequence/numbering as --target_seq."
+            )
+
+        return final_residues
 
     def run_pipeline(self):
         X = []
@@ -963,6 +1101,12 @@ class ProteinHunter_Chai:
                 render_freq=self.render_freq,
                 final_validation=self.repredict,
                 plot=self.plot,
+                contact_residues=self.contact_residues,
+                pocket_distance_threshold=self.pocket_distance_threshold,
+                no_contact_filter=self.no_contact_filter,
+                max_contact_filter_retries=self.max_contact_filter_retries,
+                contact_cutoff=self.contact_cutoff,
+                percent_x_fraction=self.percent_X / 100,
                 **self.opts,
             )
             X.append(x)

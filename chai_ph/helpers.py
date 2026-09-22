@@ -64,6 +64,54 @@ def extract_sequence_from_pdb(pdb_path, chain_id):
                 return "".join(seq)
     raise ValueError(f"Chain {chain_id} not found in {pdb_path}")
 
+def binder_binds_contacts(structure_path, binder_chain, target_chain, contact_residues, cutoff=15.0):
+    """
+    Post-hoc geometric contact check (works on .cif or .pdb via gemmi).
+
+    Returns True if at least 2 of contact_residues (1-indexed target_chain
+    residue numbers) are contacted by some binder_chain CA atom within
+    cutoff Angstroms. Mirrors boltz_ph.model_utils.binder_binds_contacts,
+    adapted to read chai_ph's .cif cycle outputs directly (no PDB conversion).
+    """
+    if isinstance(contact_residues, str):
+        if contact_residues.strip() == "":
+            return True
+        contact_residues = [int(x) for x in contact_residues.split(",") if x.strip()]
+    if not contact_residues:
+        return True
+
+    structure = gemmi.read_structure(str(structure_path))
+    model = structure[0]
+
+    def get_chain_ca(chain_id):
+        coords, resnums = [], []
+        for chain in model:
+            if chain.name != chain_id:
+                continue
+            for residue in chain:
+                for atom in residue:
+                    if atom.name == "CA":
+                        coords.append([atom.pos.x, atom.pos.y, atom.pos.z])
+                        resnums.append(residue.seqid.num)
+        return np.array(coords), resnums
+
+    binder_coords, _ = get_chain_ca(binder_chain)
+    target_coords, target_resnums = get_chain_ca(target_chain)
+    if len(binder_coords) == 0 or len(target_coords) == 0:
+        return False
+
+    contact_indices = [i for i, r in enumerate(target_resnums) if r in contact_residues]
+    if not contact_indices:
+        return False
+
+    contacted = 0
+    for idx in contact_indices:
+        distances = np.linalg.norm(binder_coords - target_coords[idx], axis=-1)
+        if np.any(distances < cutoff):
+            contacted += 1
+
+    return contacted >= 2
+
 # --- Coordinate & Geometry Utilities ---
 
 def extend(a, b, c, L, A, D):

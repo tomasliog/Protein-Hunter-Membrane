@@ -60,6 +60,65 @@ def parse_args():
         help="Enable cyclic topology for the designed chain.",
     )
 
+    # --- Pocket / Contact-Residue Conditioning (Protein Targets Only) ---
+    contact_group = parser.add_argument_group("Pocket / Contact-Residue Conditioning")
+    contact_group.add_argument(
+        "--contact_residues",
+        default="",
+        type=str,
+        help=(
+            "Comma-separated 1-indexed target_seq residue numbers the binder must contact. "
+            "Uses chai-lab's native pocket restraint (TokenPairPocketRestraint) to actively "
+            "steer the diffusion, the same mechanism as Boltz2's pocket constraint."
+        ),
+    )
+    contact_group.add_argument(
+        "--ppm_pdb",
+        default="",
+        type=str,
+        help=(
+            "Path to a PPM3.0-oriented target structure ('...out.pdb') used to restrict "
+            "--contact_residues to membrane-safe residues: solvent-exposed outside the "
+            "membrane, or pore/lumen-facing inside a barrel anchored in the membrane. If "
+            "--contact_residues is also given, it is intersected with the membrane-safe set "
+            "(residues that fall in the lipid-facing membrane region are dropped, with a "
+            "warning); if omitted, the full membrane-safe set is used as the pocket-"
+            "conditioning contacts. The PPM structure must correspond to the same sequence "
+            "and residue numbering as --target_seq."
+        ),
+    )
+    contact_group.add_argument(
+        "--ppm_chain_id",
+        default="A",
+        type=str,
+        help="Chain ID to read from --ppm_pdb. Default 'A' matches single-chain PPM3.0 monomer outputs.",
+    )
+    contact_group.add_argument(
+        "--ppm_exclude_pore_facing",
+        action="store_true",
+        default=False,
+        help="Exclude barrel-lumen/pore-facing residues; keep only residues fully outside the membrane.",
+    )
+    contact_group.add_argument(
+        "--pocket_distance_threshold",
+        default=15.0,
+        type=float,
+        help="Distance (Angstroms) used in the pocket-restraint conditioning for each contact residue.",
+    )
+    contact_group.add_argument(
+        "--no_contact_filter",
+        action="store_true",
+        default=False,
+        help="Do not filter or restart for unbound contact residues at cycle 0, and don't gate high-ipTM saves on it.",
+    )
+    contact_group.add_argument("--max_contact_filter_retries", default=6, type=int)
+    contact_group.add_argument(
+        "--contact_cutoff",
+        default=15.0,
+        type=float,
+        help="CA-CA distance (Angstroms) used by the post-hoc geometric contact filter/gate.",
+    )
+
     # --- Optimization Options ---
     opt_group = parser.add_argument_group("Optimization and Folding Parameters")
     opt_group.add_argument(

@@ -16,6 +16,7 @@ from LigandMPNN.wrapper import LigandMPNNWrapper
 from boltz_ph.constants import CHAIN_TO_NUMBER
 from utils.metrics import get_CA_and_sequence # Used implicitly in design.py
 from utils.convert import calculate_holo_apo_rmsd, convert_cif_files_to_pdb
+from utils.membrane_utils import get_membrane_safe_residues
 
 
 from model_utils import (
@@ -45,6 +46,16 @@ class InputDataBuilder:
         )
         self.protein_hunter_save_dir = f"{self.save_dir}/0_protein_hunter_design"
         os.makedirs(self.protein_hunter_save_dir, exist_ok=True)
+
+        # Resolve --contact_residues against --ppm_pdb (if given) up front,
+        # in-place on the shared args object, so that everything downstream
+        # (pocket conditioning, model potentials flag, post-cycle-0 contact
+        # filter, high-ipTM YAML gate) agrees on the same membrane-safe
+        # residue set. Must happen before ProteinHunter_Boltz._load_boltz_model()
+        # reads args.contact_residues to decide whether to enable potentials.
+        if self.args.ppm_pdb.strip():
+            num_proteins = len(smart_split(self.args.protein_seqs)) if self.args.protein_seqs else 0
+            self.args.contact_residues = self._resolve_effective_contact_residues(num_proteins)
 
 
     def _process_sequence_inputs(self):
@@ -203,9 +214,10 @@ class InputDataBuilder:
             data["templates"] = templates
 
         # Step 6: Add constraints (pocket conditioning)
-        pocket_conditioning = bool(a.contact_residues and a.contact_residues.strip())
-        if pocket_conditioning:
-            contacts = []
+        # a.contact_residues was already resolved against --ppm_pdb (if any)
+        # in __init__, before the model was loaded.
+        contacts = []
+        if a.contact_residues.strip():
             residues_chains = a.contact_residues.split("|")
             for i, residues_chain in enumerate(residues_chains):
                 residues = residues_chain.split(",")
@@ -214,10 +226,78 @@ class InputDataBuilder:
                     for res in residues
                     if res.strip() != ""
                 ])
+
+        pocket_conditioning = bool(contacts)
+        if pocket_conditioning:
             constraints = [{"pocket": {"binder": "A", "contacts": contacts}}]
             data["constraints"] = constraints
 
         return data, pocket_conditioning
+
+    def _resolve_effective_contact_residues(self, num_proteins: int) -> str:
+        """
+        Merges --contact_residues with membrane-safe residues derived from
+        --ppm_pdb (if given), per target chain. Returns a '|'-joined string
+        in the same format --contact_residues normally uses (one
+        comma-separated residue list per target chain).
+
+        If --ppm_pdb is not given, returns --contact_residues unchanged.
+        If a target chain has a PPM structure but no user-specified
+        residues, the *entire* membrane-safe residue set for that chain is
+        used as the pocket-conditioning contacts. If the user also
+        specified residues for that chain, they are intersected with the
+        membrane-safe set (any residues that fall in the lipid-facing
+        membrane region are dropped, with a warning).
+        """
+        a = self.args
+        if not a.ppm_pdb.strip():
+            return a.contact_residues
+
+        ppm_pdb_list = [p.strip() for p in a.ppm_pdb.split("|")]
+        ppm_chain_list = [c.strip() for c in a.ppm_chain_id.split("|")] if a.ppm_chain_id.strip() else []
+        user_residue_chains = a.contact_residues.split("|") if a.contact_residues.strip() else []
+
+        resolved_chains = []
+        for i in range(num_proteins):
+            ppm_path = ppm_pdb_list[i] if i < len(ppm_pdb_list) else ""
+            if not ppm_path:
+                resolved_chains.append(user_residue_chains[i] if i < len(user_residue_chains) else "")
+                continue
+
+            chain_id = (
+                ppm_chain_list[i] if i < len(ppm_chain_list)
+                else (ppm_chain_list[0] if ppm_chain_list else None)
+            )
+            chain_id = chain_id or None
+            safe_residues = set(
+                get_membrane_safe_residues(
+                    ppm_path,
+                    chain_id=chain_id,
+                    include_pore_facing=not a.ppm_exclude_pore_facing,
+                )
+            )
+
+            if i < len(user_residue_chains) and user_residue_chains[i].strip():
+                user_residues = [
+                    int(r) for r in user_residue_chains[i].split(",") if r.strip() != ""
+                ]
+                final_residues = [r for r in user_residues if r in safe_residues]
+                dropped = sorted(set(user_residues) - set(final_residues))
+                if dropped:
+                    print(
+                        f"⚠️  Dropping {len(dropped)} user-specified contact residue(s) for "
+                        f"target chain {i} that fall inside the membrane (lipid-facing): {dropped}"
+                    )
+            else:
+                final_residues = sorted(safe_residues)
+
+            print(
+                f"🧬 PPM membrane filter for target chain {i} ({ppm_path}): "
+                f"{len(final_residues)} membrane-safe contact residue(s) available."
+            )
+            resolved_chains.append(",".join(str(r) for r in final_residues))
+
+        return "|".join(resolved_chains)
 
     def _build_templates(self, protein_chain_ids):
         """
@@ -687,33 +767,38 @@ class ProteinHunter_Boltz:
 
         return run_metrics
 
-    def _save_summary_metrics(self, all_run_metrics):
-        """Saves all run metrics to a single CSV file."""
+    def _ordered_columns(self):
+        """Returns the canonical column order for summary_all_runs.csv."""
         a = self.args
         columns = ["run_id"]
-        # Columns for cycle 0 through num_cycles
         for i in range(a.num_cycles + 1):
-            columns.extend(
-                [
-                    f"cycle_{i}_iptm",
-                    f"cycle_{i}_plddt",
-                    f"cycle_{i}_iplddt",
-                    f"cycle_{i}_alanine",
-                    f"cycle_{i}_seq",
-                ]
-            )
-        # Best metric columns
+            columns.extend([
+                f"cycle_{i}_iptm",
+                f"cycle_{i}_plddt",
+                f"cycle_{i}_iplddt",
+                f"cycle_{i}_alanine",
+                f"cycle_{i}_seq",
+            ])
         columns.extend(["best_iptm", "best_cycle", "best_plddt", "best_seq"])
+        return columns
 
+    def _append_run_to_summary(self, run_metrics):
+        """Appends a single completed run's metrics to summary_all_runs.csv."""
+        columns = self._ordered_columns()
+        row = {col: run_metrics.get(col, float("nan")) for col in columns}
+        summary_csv = os.path.join(self.save_dir, "summary_all_runs.csv")
+        file_exists = os.path.isfile(summary_csv)
+        pd.DataFrame([row]).to_csv(summary_csv, mode='a', header=not file_exists, index=False)
+        print(f"✅ Run {run_metrics.get('run_id')} metrics appended to {summary_csv}")
+
+    def _save_summary_metrics(self, all_run_metrics):
+        """Re-writes summary_all_runs.csv from the full in-memory list (end-of-run consolidation)."""
+        columns = self._ordered_columns()
         summary_csv = os.path.join(self.save_dir, "summary_all_runs.csv")
         df = pd.DataFrame(all_run_metrics)
-        
-        # Ensure all expected columns are present (filling missing with NaN)
         for col in columns:
             if col not in df.columns:
                 df[col] = float("nan")
-        
-        # Filter to columns in the correct order (and existing ones)
         df = df[[c for c in columns if c in df.columns]]
         df.to_csv(summary_csv, index=False)
         print(f"\n✅ All run/cycle metrics saved to {summary_csv}")
@@ -787,8 +872,9 @@ class ProteinHunter_Boltz:
 
             run_metrics = self._run_design_cycle(data_cp, run_id, pocket_conditioning)
             all_run_metrics.append(run_metrics)
+            self._append_run_to_summary(run_metrics)
 
-        # 3. Save Summary
+        # 3. Consolidate summary (rewrites with guaranteed column order)
         self._save_summary_metrics(all_run_metrics)
 
         # 4. Run Downstream Validation

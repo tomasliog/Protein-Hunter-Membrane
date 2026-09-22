@@ -21,7 +21,11 @@ from chai_lab.data.dataset.inference_dataset import Input, load_chains_from_raw
 from chai_lab.data.dataset.msas.msa_context import MSAContext
 from chai_lab.data.dataset.embeddings.embedding_context import EmbeddingContext
 from chai_lab.data.dataset.embeddings.esm import get_esm_embedding_context
-from chai_lab.data.dataset.constraints.restraint_context import RestraintContext
+from chai_lab.data.dataset.constraints.restraint_context import (
+    RestraintContext,
+    load_manual_restraints_for_chai1,
+)
+from chai_lab.data.parsing.restraints import PairwiseInteraction, PairwiseInteractionType
 from chai_lab.data.dataset.structure.all_atom_residue_tokenizer import (
     AllAtomResidueTokenizer,
 )
@@ -411,7 +415,14 @@ class ChaiFolder:
         inputs = [
             self._create_input(seq, etype, name) for seq, name, etype, _ in sequences
         ]
-        return load_chains_from_raw(inputs, identifier="chai-folder")
+        # entity_name_as_subchain=True makes chai-lab's internal subchain_id
+        # match our own chain letters ('A' binder, 'B' target) regardless of
+        # the order chains are listed in. Restraint resolution (pocket
+        # conditioning) below looks chains up by subchain_id, so this must
+        # be stable and independent of chain ordering.
+        return load_chains_from_raw(
+            inputs, identifier="chai-folder", entity_name_as_subchain=True
+        )
 
     def _parse_chain_opts(
         self, sequences: List[Tuple[str, str, str, Dict]]
@@ -447,11 +458,63 @@ class ChaiFolder:
         structure_context.drop_glycan_leaving_atoms_inplace()
         return structure_context
 
+    def _build_pocket_restraint_context(
+        self,
+        chains: List[Chain],
+        target_residues: List[int],
+        target_seq: str,
+        binder_chain: str,
+        target_chain: str,
+        distance_threshold: float,
+    ) -> RestraintContext:
+        """
+        Builds a RestraintContext with one POCKET restraint per target
+        residue, each pinning binder_chain within distance_threshold
+        Angstroms of that target residue. This is chai-lab's native
+        TokenPairPocketRestraint conditioning, the same mechanism Boltz2
+        uses for its 'pocket' constraint -- it actively biases the diffusion
+        trajectory, unlike a post-hoc contact filter.
+
+        Passing many target_residues (e.g. all membrane-safe residues on an
+        outer-membrane protein) yields a broad/permissive pocket rather than
+        a single tight epitope, which is the intended use for membrane
+        avoidance: "bind anywhere on the exposed surface."
+        """
+        if not target_residues:
+            return RestraintContext.empty()
+
+        interactions = [
+            PairwiseInteraction(
+                chainA=binder_chain,
+                res_idxA="",
+                atom_nameA="",
+                chainB=target_chain,
+                res_idxB=f"{target_seq[resnum - 1]}{resnum}",
+                atom_nameB="",
+                connection_type=PairwiseInteractionType.POCKET,
+                max_dist_angstrom=distance_threshold,
+                min_dist_angstrom=0.0,
+                confidence=1.0,
+            )
+            for resnum in target_residues
+        ]
+        # `chains` is only used by load_manual_restraints_for_chai1 to assert
+        # against a (here, absent) crop; it must be non-empty or the loader
+        # short-circuits to RestraintContext.empty() regardless of interactions.
+        return load_manual_restraints_for_chai1(
+            chains=chains, crop_idces=None, provided_constraints=interactions
+        )
+
     def _build_feature_contexts(
         self,
         chains: List[Chain],
         structure_context: AllAtomStructureContext,
         opts_per_chain: List[ChainOpts],
+        pocket_target_residues: Optional[List[int]] = None,
+        pocket_target_seq: Optional[str] = None,
+        pocket_binder_chain: str = "A",
+        pocket_target_chain: str = "B",
+        pocket_distance_threshold: float = 15.0,
     ) -> AllAtomFeatureContext:
         """Build all feature contexts (MSA, templates, embeddings, restraints)"""
         n_tokens = structure_context.num_tokens
@@ -465,7 +528,17 @@ class ChaiFolder:
         embedding_context = self._build_embedding_context_per_chain(
             chains, opts_per_chain
         )
-        restraint_context = RestraintContext.empty()
+        if pocket_target_residues:
+            restraint_context = self._build_pocket_restraint_context(
+                chains=chains,
+                target_residues=pocket_target_residues,
+                target_seq=pocket_target_seq,
+                binder_chain=pocket_binder_chain,
+                target_chain=pocket_target_chain,
+                distance_threshold=pocket_distance_threshold,
+            )
+        else:
+            restraint_context = RestraintContext.empty()
 
         return AllAtomFeatureContext(
             chains=chains,
@@ -536,8 +609,24 @@ class ChaiFolder:
     # ==============================================================================
     # PATCH 5: Update prep_inputs() (Around line 485)
     # ==============================================================================
-    def prep_inputs(self, sequences: List[Tuple[str, str, str, Dict]]) -> None:
-        """Main entry point: prepare inputs for folding"""
+    def prep_inputs(
+        self,
+        sequences: List[Tuple[str, str, str, Dict]],
+        pocket_target_residues: Optional[List[int]] = None,
+        pocket_target_seq: Optional[str] = None,
+        pocket_binder_chain: str = "A",
+        pocket_target_chain: str = "B",
+        pocket_distance_threshold: float = 15.0,
+    ) -> None:
+        """
+        Main entry point: prepare inputs for folding.
+
+        pocket_target_residues (optional): 1-indexed residue numbers on
+        pocket_target_chain (into pocket_target_seq) that pocket_binder_chain
+        must be conditioned to approach, using chai-lab's native pocket
+        restraint (TokenPairPocketRestraint). Leave as None for unconditional
+        folding, matching prior behavior.
+        """
         # Clear any previous intermediate state, keeping loaded models
         self._cleanup_intermediate_data()  # Clears _init_reps, _trunk_reps, _current_batch["features"]
         self.state = FoldingState()  # Reset self.state, keeping models
@@ -561,7 +650,14 @@ class ChaiFolder:
 
             # Build feature context and batch (on CPU initially)
             self.state.feature_context = self._build_feature_contexts(
-                chains, structure_context, opts_per_chain
+                chains,
+                structure_context,
+                opts_per_chain,
+                pocket_target_residues=pocket_target_residues,
+                pocket_target_seq=pocket_target_seq,
+                pocket_binder_chain=pocket_binder_chain,
+                pocket_target_chain=pocket_target_chain,
+                pocket_distance_threshold=pocket_distance_threshold,
             )
             # PATCH 9 (GLOBAL): self.state.batch -> self._current_batch
             # Store the full batch (inputs+features) temporarily on CPU
